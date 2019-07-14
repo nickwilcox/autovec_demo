@@ -27,7 +27,7 @@ Generating SIMD by hand in C/C++ is well established and no more or less safe th
 Targeting the SIMD instructions on Intel's X64 architecture, known as SSE, we use intrinsics functions provided by
 the compiler. Each instruction function is documented to map to a single assembler instructions.
 
-```
+```C
 #include <assert.h>
 #include <stdint.h>
 #include <emmintrin.h>
@@ -87,7 +87,7 @@ Not every loop is able to be vectorized. There may not be a way to express the c
 ### First Attempt at Taking Advantage of Auto-Vectorization in Rust
 If we take the signature of our C function and switch from raw pointers to slices, we can generate a version of the loop that processes one sample at a time.
 
-```
+```rust
 pub fn mix_mono_to_stereo_1(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
     for i in 0..src.len() {
         dst[i * 2 + 0] = src[i] * gain_l;
@@ -98,7 +98,7 @@ pub fn mix_mono_to_stereo_1(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f
 
 We can then use the very helpful Godbolt compiler explorer site to [preview](https://godbolt.org/z/Das0yY) what the assembler output of this Rust code would be.
 
-```
+```assembly
 example::mix_mono_to_stereo_1:
         push    rax
         test    rcx, rcx
@@ -151,7 +151,7 @@ But we didn't see any bounds checks in the input slice. That's because in the Ru
 
 ### Second Attempt
 Can we prove to compiler that all our writes to the destination slice are within bounds? Our second attempt looks like
-```
+```rust
 pub fn mix_mono_to_stereo_2(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
     let dst_known_bounds = &mut dst[0..src.len() * 2];
     for i in 0..src.len() {
@@ -171,7 +171,7 @@ It's worth taking a step back and thinking about what the destination indexing c
 
 That's a lot of implicit assumptions about the structure of the slice. Let's use the type system to make it more explicit to both the compiler and any future readers of our code who aren't familiar with digital audio conventions.
 
-```
+```rust
 #[repr(C)]
 pub struct StereoSample {
     l: f32,
