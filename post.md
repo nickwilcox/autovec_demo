@@ -1,94 +1,15 @@
 # Taking Advantage of Auto-Vectorization in Rust
-Recently I wrote some audio processing code in Rust. In the past I've worked on a lot of audio processing code in C++ where performance was critical and spent a lot of time making sure the code could process audio samples a fast as possible.
+Recently I wrote some audio processing code in Rust. In the past I've written a lot of audio processing code in C++ where performance was critical and spent a lot of time making sure it could process audio samples a fast as possible.
 
-We're going to take one small piece of audio processing code and take a look at how we can optimize the Rust version.
+We're going to take one small piece of audio processing code and take a look at how we can optimize it in Rust.
 
 ## Mixing Mono to Stereo
-The function we're going to optimize is taking a mono audio signal and mixing it into a stereo signal containing both a left and right component.
+The function we're going to optimize is taking a mono audio signal, represented as vector of floating point values, and mixing it into a stereo signal containing left and right samples interleaved.
 
-The pseudo-code is
-```
-for each input sample
-    output sample left = input sample * left gain
-    output sample right = input sample * right gain
-```
-The processing is very simple, but audio signals typically contain 48000 samples per second. So we are going to want this loop to be able to run as quickly as possible.
-
-We are also going to require that the output be interleaved samples - this means that we alternate samples from the left and right signal.
-
-## SIMD for Optimization
-One of the tools available when optimizing are Single Instruction Multiple Data (SIMD) CPU instructions. They differ from typical CPU instructions by the fact they are able to operate on multiple values at once, in the same time it takes the corresponding scalar instruction to operate on a single value.
-
-Each sample we process in our mixing loop is operated on in an identical way to all other samples. This makes our mixing loop a perfect candidate for optimization using SIMD instructions. We will be able to process four samples at once for the same CPU cost as a single sample.
-
-## SIMD in C
-Generating SIMD by hand in C/C++ is well established and no more or less safe than any other code using pointers.
-
-Targeting the SIMD instructions on Intel's X64 architecture, known as SSE, we use intrinsics functions provided by
-the compiler. Each instruction function is documented to map to a single assembler instructions.
-
-```C
-#include <assert.h>
-#include <stdint.h>
-#include <emmintrin.h>
-
-void mix_mono_to_stereo_intrinsics(uint32_t num_samples, float *dst, float *src, float gain_l, float gain_r)
-{
-    // the number of samples to mix must be a multiple of 4
-    assert(num_samples % 4 == 0);
-
-    // create SIMD variables with each element set to the same value
-    // mul_l = |  gain_l |  gain_l |  gain_l |  gain_l |
-    // mul_r = |  gain_r |  gain_r |  gain_r |  gain_r |
-    __m128 mul_l = _mm_set1_ps(gain_l);
-    __m128 mul_r = _mm_set1_ps(gain_r);
-
-    // process the source samples in blocks of four
-    for (uint32_t i = 0; i < num_samples; i += 4)
-    {
-        // load 4 of our source samples
-        // in = | src(i + 0) | src(i + 1) | src(i + 2) | src(i + 3) |
-        __m128 in = _mm_loadu_ps(src + i);
-
-        // multiply each of the four input values by the left and right volumes
-        // we now have two variables containing four output values is each
-        // out_l = | src(i + 0) * gain_l | src(i + 1) * gain_l | src(i + 2) * gain_l | src(i + 3) * gain_l |
-        // out_r = | src(i + 0) * gain_r | src(i + 1) * gain_r | src(i + 2) * gain_r | src(i + 3) * gain_r |
-        __m128 out_l = _mm_mul_ps(in, mul_l);
-        __m128 out_r = _mm_mul_ps(in, mul_r);
-
-        // re-arrange the output values so that each left-right pair is next to each other
-        // out_lo = | src(i + 0) * gain_l | src(i + 0) * gain_r | src(i + 1) * gain_l | src(i + 1) * gain_r |
-        // out_hi = | src(i + 2) * gain_l | src(i + 2) * gain_r | src(i + 3) * gain_l | src(i + 3) * gain_r |
-        __m128 out_lo = _mm_unpacklo_ps(out_l, out_r);
-        __m128 out_hi = _mm_unpackhi_ps(out_l, out_r);
-
-        // write the four output samples (8 values) to our destination memory
-        _mm_storeu_ps(dst + (2 * i + 0), out_lo);
-        _mm_storeu_ps(dst + (2 * i + 4), out_hi);
-    }
-}
-```
-
-This is only a limited implementation of the loop as it can only handle lengths that are a multiple of four. It also shows that despite the original algorithm being very simple the intrinsic version can quickly become complicated.
-
-## SIMD In Rust
-Rust includes a crate in core `core::arch::x86_64` that provides intrinsics the will be familiar to anyone who's worked with intrinsics in C.
-
-All the intrinsic functions are marked **unsafe** as they work outside the memory safety provided by default in Rust.
-
-Is it possible to write safe Rust code and still gain the performance advantages of SIMD?
-
-## Auto-Vectorization
-Auto-Vectorization refers to the compiler being able to take a loop, and generate code that uses SIMD instructions to process multiple iterations of the loop at once.
-
-Not every loop is able to be vectorized. There may not be a way to express the code in the loop using the available SIMD instructions on a particular target. Also the compiler has to be able to prove that the SIMD version has exactly the same behavior as the scalar version. In Rust this includes obeying all the type and memory safety requirements. However those same type and memory requirements of Rust can also aid the compiler in being able to auto-vectorize.
-
-### First Attempt at Taking Advantage of Auto-Vectorization in Rust
-If we take the signature of our C function and switch from raw pointers to slices, we can generate a version of the loop that processes one sample at a time.
+The simple Rust function takes two slices, a source mono signal and a destination stereo signal
 
 ```rust
-pub fn mix_mono_to_stereo_1(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
+pub fn mix_mono_to_stereo(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
     for i in 0..src.len() {
         dst[i * 2 + 0] = src[i] * gain_l;
         dst[i * 2 + 1] = src[i] * gain_r;
@@ -96,7 +17,100 @@ pub fn mix_mono_to_stereo_1(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f
 }
 ```
 
-We can then use the very helpful Godbolt compiler explorer site to [preview](https://godbolt.org/z/Das0yY) what the assembler output of this Rust code would be.
+The processing is very simple, but audio signals typically contain 48000 samples per second. So we are going to want this loop to be able to run as quickly as possible.
+
+If we put this version of our function into a benchmarking tool we can get idea of how long it takes.
+
+|                 | Average time to process 100,000 samples |
+|-----------------|-----------------------------------------|
+| Initial Version | 77.67 us                                |
+
+At this point we don't know if we can make it faster, but we have our starting number.
+
+## SIMD for Optimization
+One of the tools available when optimizing are Single Instruction Multiple Data (SIMD) CPU instructions. They differ from typical CPU instructions by the fact they are able to operate on four values at once, in a much shorter time than it takes to run the corresponding scalar instruction four times.
+
+Each sample we process in our mixing loop is operated on in an identical way to all other samples. This makes our mixing loop a perfect candidate for optimization using SIMD instructions. We will be able to process four samples at once for the same CPU cost as a single sample.
+
+One way to make sure our loop is implemented using SIMD intructions is to write it by hand using instrinsic functions. These are simple functions that map directly to CPU instructions, and are a way of guaranteeing what instructions will be generated by the compiler.
+
+Rust includes a crate `core::arch::x86_64` that provides functions the will be familiar to anyone who's worked with intrinsics in C. All the intrinsic functions are marked **unsafe** as they work outside the memory safety provided by default in Rust. As the name of the crate suggests these intrinsics functions map to instructions for x86_64 CPU's. Code that uses them will not compile on other platforms.
+
+```rust
+pub fn mix_mono_to_stereo_intrinsics_rust(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
+    assert_eq!(src.len() % 4, 0);
+    assert_eq!(dst.len(), src.len() * 2);
+    unsafe {
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_mut_ptr();
+
+        // create SIMD variables with each element set to the same value
+        // mul_l = |  gain_l |  gain_l |  gain_l |  gain_l |
+        // mul_r = |  gain_r |  gain_r |  gain_r |  gain_r |
+        let mul_l = _mm_set1_ps(gain_l);
+        let mul_r = _mm_set1_ps(gain_r);
+
+        // process the source samples in blocks of four
+        let mut i = 0;
+        while i < src.len() {
+            // load 4 of our source samples
+            // input = | src(i + 0) | src(i + 1) | src(i + 2) | src(i + 3) |
+            let input = _mm_loadu_ps(src_ptr.add(i));
+
+            // multiply each of the four input values by the left and right volumes
+            // we now have two variables containing four output values is each
+            // out_l = | src(i + 0) * gain_l | src(i + 1) * gain_l | src(i + 2) * gain_l | src(i + 3) * gain_l |
+            // out_r = | src(i + 0) * gain_r | src(i + 1) * gain_r | src(i + 2) * gain_r | src(i + 3) * gain_r |
+            let out_l = _mm_mul_ps(input, mul_l);
+            let out_r = _mm_mul_ps(input, mul_r);
+
+            // re-arrange the output values so that each left-right pair is next to each other
+            // out_lo = | src(i + 0) * gain_l | src(i + 0) * gain_r | src(i + 1) * gain_l | src(i + 1) * gain_r |
+            // out_hi = | src(i + 2) * gain_l | src(i + 2) * gain_r | src(i + 3) * gain_l | src(i + 3) * gain_r |
+            let out_lo = _mm_unpacklo_ps(out_l, out_r);
+            let out_hi = _mm_unpackhi_ps(out_l, out_r);
+
+            // write the four output samples (8 f32 values) to our destination memory
+            _mm_storeu_ps(dst_ptr.add(2 * i + 0), out_lo);
+            _mm_storeu_ps(dst_ptr.add(2 * i + 4), out_hi);
+
+            i += 4;
+        }
+    }
+}
+```
+
+If we put this version into our benchmarking tests we can see the performance improvement.
+
+|                 | Average time to process 100,000 samples |
+|-----------------|-----------------------------------------|
+| Initial Version | 77.67 us                                |
+| Rust Intrinsics | 25.781 us                               |
+
+We've gotten a 3x performance improvement. But there are downsides. We've added a lot more complexity to our function, introduced unsafe code, and our performance gains are limited to x86_64 platforms.
+
+Is there another option for taking advantage of the performance gains from SIMD?
+
+## Auto-Vectorization
+Auto-Vectorization refers to the compiler being able to take a loop, and generate code that uses SIMD instructions to process multiple iterations of the loop at once.
+
+Not every loop is able to be vectorized. There may not be a way to express the code in the loop using the available SIMD instructions on the target CPU. Also the compiler has to be able to prove that the SIMD version has exactly the same behavior as the scalar version. In Rust this includes obeying all the type and memory safety requirements. However those same type and memory requirements of Rust can also aid the compiler in being able to auto-vectorize.
+
+### First Attempt at Taking Advantage of Auto-Vectorization in Rust
+Our first attempt at auto-vectorization is to take our simple safe Rust function
+
+```rust
+pub fn mix_mono_to_stereo(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
+    for i in 0..src.len() {
+        dst[i * 2 + 0] = src[i] * gain_l;
+        dst[i * 2 + 1] = src[i] * gain_r;
+    }
+}
+```
+
+we can then use the very helpful Godbolt compiler explorer site to [preview](https://godbolt.org/z/Das0yY) what the assembler output of this Rust code is. 
+
+(*This is generated from the 1.35 compiler with the `-O` argument to turn on optimizations*)
 
 ```assembly
 example::mix_mono_to_stereo_1:
@@ -135,6 +149,8 @@ example::mix_mono_to_stereo_1:
         ud2
 ```
 
+We don't have to be know what every CPU instructions does or what value is contained in every register to be able to get an idea of how the compiler has turned our Rust code into machine code.
+
 Looking through the disassembly we can see six sections, marked by the labels `example::mix_mono_to_stereo_1`, `.LBB0_2`, and `.LBB0_5`, to `.LBB0_8`. 
 
 The first section has a label with the name of our function, and is called the function prelude. It contains code to deal with our function arguments and setting up the stack. It also contains a check that if the length of the `src` slice is zero we can exit the function straight away.
@@ -164,8 +180,10 @@ Here we create a new slice with bounds that are known to the compiler when it's 
 
 Unfortunately if we check the [assembly output](https://godbolt.org/z/UPUWL1) of the compiler it looks very similar to our first attempt. The loop body still uses the `mulss` to perform a single multiply at a time, and there is still a check on the bounds for each access of the destination slice.
 
+Because the compiler has produced almost the same assembly we won't benchmark this function.
+
 ### Third Attempt
-The way we index the destination slice is too complicated for the compiler to prove that all accesses are in bounds.
+The way we index the destination slice must be too complicated for the compiler to prove that all accesses are in bounds.
 
 It's worth taking a step back and thinking about what the destination indexing code is expressing: The destination slice is twice as long as the input slice, where even indexed value represent the left channel of the signal, and odd indexed values represent the right channel.
 
@@ -190,7 +208,7 @@ pub fn mix_mono_to_stereo_3(dst: &mut [StereoSample], src: &[MonoSample], gain_l
 }
 ```
 
-If we check the [assembler output](https://godbolt.org/z/3etzSu) we can immediately see there is a lot more assembly generated. So much that I won't break it all down. But scanning through we can see there are blocks containing the `mulps`, `unpcklps` and `unpckhps` instructions we used in the hand written instrinsic version. This shows that the compiler has been able to vectorize our loop to process four samples at a time using SIMD.
+If we check the [assembler output](https://godbolt.org/z/3etzSu) we can immediately see there is a lot more assembly generated. So much that I won't break it all down. But scanning through we can see there are blocks containing the `mulps`, `unpcklps` and `unpckhps` instructions we used in the hand written SIMD version. This shows that the compiler has been able to vectorize our loop to process four samples at a time using SIMD.
 
 If we examine the structure of the assembler blocks we can get an rough idea of what it has actually generated. It goes beyond our simple hand written version, and includes multiple stages for processing all samples.
 
@@ -200,8 +218,17 @@ The stages go in order:
 3. Process sixteen samples at time using SIMD until the number of samples remaining is less than sixteen
 4. Process four samples at time using SIMD until no samples remain
 
+If we add this version to our benchmarks we get
+|                         | Average time to process 100,000 samples |
+|-------------------------|-----------------------------------------|
+| Initial Version         | 77.67 us                                |
+| Rust Intrinsics         | 25.781 us                               |
+| Rust Auto-Vectorization | 25.535 us                               |
+
+So we've successfully been able to match the performance of the hand written intrinsics with simple Rust code.
+
+We can also check the [assembler output](https://godbolt.org/z/nlYe6N) for an AArch64 target and see that we're able to also produce code using Arm's SIMD instruction. This is another advantage over using hand written SIMD which must be re-written for each target architecture.
+
 ## Conclusion
 
 By taking advantage of the Rust type system and slice bounds safety we are able to write simple code that produces optimized SIMD output equal to that written by hand.
-
-We can also check the [assembler output](https://godbolt.org/z/nlYe6N) for an AArch64 target and see that we're able to also produce code using Arm's SIMD instruction. This is another advantage over using hand written intrinsics which must be re-written for each target architecture. 
