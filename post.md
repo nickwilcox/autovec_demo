@@ -1,12 +1,12 @@
 # Taking Advantage of Auto-Vectorization in Rust
-Recently I wrote some audio processing code in Rust. In the past I've written a lot of audio processing code in C++ where performance was critical and spent a lot of time making sure it could process audio samples a fast as possible.
+Recently on a project I wrote some audio processing code in Rust. In the past I've used C++ to write audio processing code for situations where performance was critical. I wanted to take that C++ optimisation experience and see what is possible using Rust.
 
-We're going to take one small piece of audio processing code and take a look at how we can optimize it in Rust.
+We're going to take one small piece of audio processing code and take a look at how we can optimize it in Rust. Along the way we're going to learn about optimisation using **Single Instruction Multiple Data** CPU instructions, how to quickly check the assembler output of the compiler, and simple changes we can make to our Rust code to produce faster programs.
 
 ## Mixing Mono to Stereo
-The function we're going to optimize is taking a mono audio signal, represented as vector of floating point values, and mixing it into a stereo signal containing left and right samples interleaved.
+The function we're going to optimize is taking a mono audio signal, represented as a vector of floating point values, and mixing it into a stereo audio signal containing left and right samples interleaved.
 
-The simple Rust function takes two slices, a source mono signal and a destination stereo signal
+The simple Rust function takes two slices, a source mono signal and a mutable destination stereo signal
 
 ```rust
 pub fn mix_mono_to_stereo(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32) {
@@ -108,9 +108,9 @@ pub fn mix_mono_to_stereo(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f32
 }
 ```
 
-we can then use the very helpful Godbolt compiler explorer site to [preview](https://godbolt.org/z/Das0yY) what the assembler output of this Rust code is. 
+we can then use the very helpful Godbolt compiler explorer site to [preview](https://godbolt.org/z/5_PjJ5) what the assembler output of this Rust code is. 
 
-(*This is generated from the 1.35 compiler with the `-O` argument to turn on optimizations*)
+(*This is generated from the 1.43 compiler with the `-O` argument to turn on optimizations*)
 
 ```assembly
 example::mix_mono_to_stereo_1:
@@ -118,23 +118,22 @@ example::mix_mono_to_stereo_1:
         test    rcx, rcx
         je      .LBB0_5
         mov     r8, rsi
-        xor     eax, eax
+        xor     esi, esi
 .LBB0_2:
-        lea     rsi, [rax + rax]
         cmp     rsi, r8
         jae     .LBB0_6
-        movss   xmm2, dword ptr [rdx + 4*rax]
+        movss   xmm2, dword ptr [rdx + 2*rsi]
         movaps  xmm3, xmm2
         mulss   xmm3, xmm0
         movss   dword ptr [rdi + 4*rsi], xmm3
-        or      rsi, 1
-        cmp     rsi, r8
+        lea     rax, [rsi + 1]
+        cmp     rax, r8
         jae     .LBB0_8
-        add     rax, 1
         mulss   xmm2, xmm1
-        movss   dword ptr [rdi + 4*rsi], xmm2
-        cmp     rax, rcx
-        jb      .LBB0_2
+        movss   dword ptr [rdi + 4*rsi + 4], xmm2
+        add     rsi, 2
+        add     rcx, -1
+        jne     .LBB0_2
 .LBB0_5:
         pop     rax
         ret
@@ -143,6 +142,7 @@ example::mix_mono_to_stereo_1:
         jmp     .LBB0_7
 .LBB0_8:
         lea     rdi, [rip + .L__unnamed_2]
+        mov     rsi, rax
 .LBB0_7:
         mov     rdx, r8
         call    qword ptr [rip + core::panicking::panic_bounds_check@GOTPCREL]
@@ -178,7 +178,7 @@ pub fn mix_mono_to_stereo_2(dst: &mut [f32], src: &[f32], gain_l: f32, gain_r: f
 ```
 Here we create a new slice with bounds that are known to the compiler when it's processing this function. Hopefully it will be able to prove based on this new slice being exactly twice as long as the source slice, no access using the index `i * 2 + 0` or `i * 2 + 1` could ever be out of bounds.
 
-Unfortunately if we check the [assembly output](https://godbolt.org/z/UPUWL1) of the compiler it looks very similar to our first attempt. The loop body still uses the `mulss` to perform a single multiply at a time, and there is still a check on the bounds for each access of the destination slice.
+Unfortunately if we check the [assembly output](https://godbolt.org/z/GhyEEK) of the compiler it looks very similar to our first attempt. The loop body still uses the `mulss` to perform a single multiply at a time, and there is still a check on the bounds for each access of the destination slice.
 
 Because the compiler has produced almost the same assembly we won't benchmark this function.
 
@@ -208,7 +208,7 @@ pub fn mix_mono_to_stereo_3(dst: &mut [StereoSample], src: &[MonoSample], gain_l
 }
 ```
 
-If we check the [assembler output](https://godbolt.org/z/3etzSu) we can immediately see there is a lot more assembly generated. So much that I won't break it all down. But scanning through we can see there are blocks containing the `mulps`, `unpcklps` and `unpckhps` instructions we used in the hand written SIMD version. This shows that the compiler has been able to vectorize our loop to process four samples at a time using SIMD.
+If we check the [assembler output](https://godbolt.org/z/_IuMAS) we can immediately see there is a lot more assembly generated. So much that I won't break it all down. But scanning through we can see there are blocks containing the `mulps`, `unpcklps` and `unpckhps` instructions we used in the hand written SIMD version. This shows that the compiler has been able to vectorize our loop to process four samples at a time using SIMD.
 
 If we examine the structure of the assembler blocks we can get an rough idea of what it has actually generated. It goes beyond our simple hand written version, and includes multiple stages for processing all samples.
 
@@ -227,7 +227,7 @@ If we add this version to our benchmarks we get
 
 So we've successfully been able to match the performance of the hand written intrinsics with simple Rust code.
 
-We can also check the [assembler output](https://godbolt.org/z/nlYe6N) for an AArch64 target and see that we're able to also produce code using Arm's SIMD instruction. This is another advantage over using hand written SIMD which must be re-written for each target architecture.
+We can also check the [assembler output](https://godbolt.org/z/vqXU9v) for an AArch64 target and see that we're able to also produce code using Arm's SIMD instruction. This is another advantage over using hand written SIMD which must be re-written for each target architecture.
 
 ## Conclusion
 
